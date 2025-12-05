@@ -2,9 +2,9 @@
   "name": "portfolio-review",
   "version": "1.0.0",
   "type": "module",
-  "main": "screenshot.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node screenshot.js"
+    "start": "node server.js"
   },
   "keywords": [],
   "author": "",
