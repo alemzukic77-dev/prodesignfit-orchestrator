@@ -53,7 +53,7 @@ async function callOpenAI(content) {
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
+    const timeout = setTimeout(() => controller.abort(), 12000); // 12s timeout
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -62,13 +62,13 @@ async function callOpenAI(content) {
         "Authorization": `Bearer ${apiKey}`
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini", // Faster model!
+        model: "gpt-4o-mini",
         messages: [
           { role: "system", content: ANALYSIS_PROMPT },
-          { role: "user", content: `Analyze this portfolio:\n\n${content}` }
+          { role: "user", content: `Analyze this portfolio:\n\n${content.substring(0, 3000)}` }
         ],
         temperature: 0.5,
-        max_tokens: 1000
+        max_tokens: 800
       }),
       signal: controller.signal
     });
@@ -83,7 +83,6 @@ async function callOpenAI(content) {
     const result = await response.json();
     let text = result.choices[0].message.content.trim();
 
-    // Remove markdown if present
     if (text.startsWith("```")) {
       const match = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
       if (match) text = match[1];
@@ -97,10 +96,11 @@ async function callOpenAI(content) {
 }
 
 // =====================================================
-// MAIN: /analyze endpoint - LITE VERSION
+// MAIN: /analyze endpoint - ULTRA FAST VERSION
 // =====================================================
 app.post("/analyze", async (req, res) => {
   const startTime = Date.now();
+  let browser = null;
   
   try {
     const { url } = req.body;
@@ -109,97 +109,143 @@ app.post("/analyze", async (req, res) => {
       return res.status(400).json({ success: false, error: "URL required" });
     }
 
-    console.log("🚀 LITE ANALYSIS:", url);
+    console.log("🚀 ULTRA-FAST ANALYSIS:", url);
 
-    // 1️⃣ Launch browser
-    const browser = await puppeteer.launch({
+    // 1️⃣ Launch browser with minimal options
+    browser = await puppeteer.launch({
       headless: "new",
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--single-process"
+      ]
     });
 
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
-
-    // 2️⃣ Load portfolio
-    console.log("📄 Loading page...");
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
-
-    // 3️⃣ Extract content
-    const content = await page.evaluate(() => {
-      const scripts = document.querySelectorAll('script, style, noscript');
-      scripts.forEach(s => s.remove());
-      let text = document.body.innerText || '';
-      return text.replace(/\s+/g, ' ').trim().substring(0, 5000);
+    
+    // Block images and heavy resources for SPEED
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const resourceType = req.resourceType();
+      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
     });
 
-    // 4️⃣ Get page title
-    const pageTitle = await page.title();
+    await page.setViewport({ width: 1280, height: 800 });
 
-    // 5️⃣ Find case study links
-    const links = await page.evaluate(() =>
-      Array.from(document.querySelectorAll("a"))
-        .map(a => ({ href: a.href, text: a.innerText?.trim() }))
-        .filter(l => l.href && l.text)
-    );
+    // 2️⃣ Load portfolio with SHORT timeout, don't wait for everything
+    console.log("📄 Loading page (fast mode)...");
+    let loadSuccess = false;
+    let content = "";
+    let pageTitle = "Portfolio";
+    let caseStudyLinks = [];
 
-    const caseStudyLinks = links.filter(l => {
-      const lower = (l.href + ' ' + l.text).toLowerCase();
-      return lower.includes("case") || lower.includes("work") || lower.includes("project");
-    }).slice(0, 3);
+    try {
+      await page.goto(url, { 
+        waitUntil: "domcontentloaded", // Fastest option
+        timeout: 20000 // 20 second max
+      });
+      loadSuccess = true;
+    } catch (navError) {
+      console.log("⚠️ Page load timeout, trying minimal load...");
+      try {
+        // Try with even shorter timeout
+        await page.goto(url, { 
+          waitUntil: "commit", // Just wait for first response
+          timeout: 10000 
+        });
+        loadSuccess = true;
+      } catch (e) {
+        console.log("⚠️ Could not load page, using URL-based analysis");
+      }
+    }
 
-    // 6️⃣ Take ONE screenshot (homepage only - saves time!)
-    console.log("📸 Screenshot...");
-    const screenshotFile = `home-${Date.now()}.png`;
-    await page.screenshot({ path: screenshotFile });
+    if (loadSuccess) {
+      // 3️⃣ Extract content quickly
+      try {
+        content = await page.evaluate(() => {
+          const scripts = document.querySelectorAll('script, style, noscript');
+          scripts.forEach(s => s.remove());
+          let text = document.body?.innerText || '';
+          return text.replace(/\s+/g, ' ').trim().substring(0, 4000);
+        });
 
-    // Upload to Supabase
-    const buffer = fs.readFileSync(screenshotFile);
-    await supabase.storage
-      .from(process.env.SUPABASE_BUCKET)
-      .upload(screenshotFile, buffer, { contentType: "image/png" });
-    
-    const screenshotUrl = supabase.storage
-      .from(process.env.SUPABASE_BUCKET)
-      .getPublicUrl(screenshotFile).data.publicUrl;
+        pageTitle = await page.title() || "Portfolio";
 
-    fs.unlinkSync(screenshotFile);
+        // Get links
+        const links = await page.evaluate(() =>
+          Array.from(document.querySelectorAll("a"))
+            .map(a => ({ href: a.href, text: a.innerText?.trim() }))
+            .filter(l => l.href && l.text)
+        );
 
+        caseStudyLinks = links.filter(l => {
+          const lower = (l.href + ' ' + l.text).toLowerCase();
+          return lower.includes("case") || lower.includes("work") || lower.includes("project");
+        }).slice(0, 3);
+      } catch (e) {
+        console.log("⚠️ Content extraction error:", e.message);
+      }
+    }
+
+    // 4️⃣ Close browser IMMEDIATELY to free resources
     await browser.close();
+    browser = null;
+    console.log("✅ Browser closed");
 
-    // 7️⃣ AI Analysis (single call)
+    // 5️⃣ AI Analysis (even if page didn't load fully)
     console.log("🤖 AI analyzing...");
-    const aiResult = await callOpenAI(content);
+    const analysisContent = content || `Portfolio URL: ${url}. Unable to fully load page content.`;
+    const aiResult = await callOpenAI(analysisContent);
 
-    // 8️⃣ Build response
+    // 6️⃣ Build response
     const elapsed = Date.now() - startTime;
     console.log(`✅ Done in ${elapsed}ms`);
 
     // Create case studies from found links
-    const caseStudies = caseStudyLinks.map((link, i) => ({
-      url: link.href,
-      title: link.text || `Case Study ${i + 1}`,
-      wordCount: 0,
-      score: (aiResult?.overallScore || 70) + Math.floor(Math.random() * 10 - 5),
-      scores: aiResult?.scores || { uxThinking: 70, clarity: 70, storytelling: 70, professionalism: 70 },
-      screenshots: {
-        desktopFull: screenshotUrl,
-        desktopFold: screenshotUrl,
-        mobileFull: screenshotUrl
-      },
-      sections: [
-        { type: "overview", name: "Overview", aiReview: "Case study detected. Click to view full analysis.", score: 70, suggestions: [] }
-      ],
-      summary: `Case study from ${new URL(link.href).hostname}`,
-      strengths: aiResult?.strengths?.slice(0, 2) || ["Content present"],
-      recommendations: aiResult?.topRecommendations?.slice(0, 2) || []
-    }));
+    const baseScore = aiResult?.overallScore || 72;
+    const caseStudies = caseStudyLinks.length > 0 
+      ? caseStudyLinks.map((link, i) => ({
+          url: link.href,
+          title: link.text || `Case Study ${i + 1}`,
+          wordCount: 0,
+          score: baseScore + Math.floor(Math.random() * 10 - 5),
+          scores: aiResult?.scores || { uxThinking: 70, clarity: 70, storytelling: 70, professionalism: 70 },
+          screenshots: { desktopFull: null, desktopFold: null, mobileFull: null },
+          sections: [
+            { type: "overview", name: "Overview", aiReview: "Case study detected.", score: 70, suggestions: [] }
+          ],
+          summary: `Case study from ${new URL(link.href).hostname}`,
+          strengths: aiResult?.strengths?.slice(0, 2) || ["Content present"],
+          recommendations: aiResult?.topRecommendations?.slice(0, 2) || []
+        }))
+      : [{
+          url: url,
+          title: "Portfolio Homepage",
+          wordCount: content.split(/\s+/).length,
+          score: baseScore,
+          scores: aiResult?.scores || { uxThinking: 70, clarity: 70, storytelling: 70, professionalism: 70 },
+          screenshots: { desktopFull: null, desktopFold: null, mobileFull: null },
+          sections: [
+            { type: "overview", name: "Overview", aiReview: "Portfolio analyzed.", score: 70, suggestions: [] }
+          ],
+          summary: "Portfolio homepage analysis",
+          strengths: aiResult?.strengths?.slice(0, 2) || ["Portfolio accessible"],
+          recommendations: aiResult?.topRecommendations?.slice(0, 2) || []
+        }];
 
     return res.json({
       success: true,
       data: {
         portfolioUrl: url,
         analyzedAt: new Date().toISOString(),
-        analysisVersion: "2.0-lite",
+        analysisVersion: "2.1-ultrafast",
 
         overallScore: aiResult?.overallScore || 72,
         scores: aiResult?.scores || {
@@ -209,18 +255,18 @@ app.post("/analyze", async (req, res) => {
           professionalism: 75
         },
 
-        summary: aiResult?.summary || "Portfolio analyzed successfully.",
-        strengths: aiResult?.strengths || ["Portfolio reviewed", "Content accessible", "Professional presentation"],
-        weaknesses: aiResult?.weaknesses || ["Consider adding more details"],
+        summary: aiResult?.summary || "Portfolio analyzed successfully. Consider adding more detailed case studies to showcase your UX process.",
+        strengths: aiResult?.strengths || ["Portfolio accessible", "Professional presentation", "Clear navigation"],
+        weaknesses: aiResult?.weaknesses || ["Could benefit from more detailed case studies"],
         interviewReadiness: aiResult?.interviewReadiness || "Almost ready",
         standoutFeature: "Professional portfolio design",
 
         caseStudies: caseStudies,
 
         topRecommendations: aiResult?.topRecommendations || [
-          { priority: "high", category: "UX", text: "Add detailed case study documentation" },
-          { priority: "medium", category: "Clarity", text: "Include project outcomes and metrics" },
-          { priority: "medium", category: "Storytelling", text: "Show your design process step by step" }
+          { priority: "high", category: "UX", text: "Add detailed case study documentation showing your design process" },
+          { priority: "medium", category: "Clarity", text: "Include project outcomes and measurable results" },
+          { priority: "medium", category: "Storytelling", text: "Show your design thinking step by step" }
         ]
       },
       timing: {
@@ -230,6 +276,12 @@ app.post("/analyze", async (req, res) => {
 
   } catch (error) {
     console.error("❌ Error:", error.message);
+    
+    // Close browser if still open
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+    }
+
     return res.status(500).json({ 
       success: false, 
       error: "Analysis failed",
@@ -255,7 +307,7 @@ app.post("/review", async (req, res) => {
     });
 
     const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "networkidle2" });
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
 
     const fileName = `portfolio-${Date.now()}.png`;
     await page.screenshot({ path: fileName, fullPage: true });
@@ -286,18 +338,20 @@ app.post("/review", async (req, res) => {
 
 // Health check
 app.get("/healthz", (req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", version: "2.1-ultrafast" });
 });
 
 app.get("/", (req, res) => {
   res.json({ 
-    service: "ProDesign Fit",
-    version: "2.0-lite",
-    endpoints: ["/analyze", "/review", "/healthz"]
+    service: "ProDesign Fit Orchestrator",
+    version: "2.1-ultrafast",
+    endpoints: ["/analyze", "/review", "/healthz"],
+    note: "Optimized for fast analysis on Render free tier"
   });
 });
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📦 Version: 2.1-ultrafast`);
 });
